@@ -1,0 +1,161 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Словарик · разбор английских слов</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>📖</text></svg>">
+<style>
+  :root {
+    --bg: #faf6f1;
+    --card: #ffffff;
+    --ink: #3d3630;
+    --muted: #9a8f83;
+    --accent: #c2704f;
+    --accent-soft: #f3e2d9;
+    --border: #eadfd4;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: Georgia, 'Times New Roman', serif;
+    background: var(--bg);
+    color: var(--ink);
+    min-height: 100vh;
+    padding: 24px 16px 64px;
+  }
+  .wrap { max-width: 640px; margin: 0 auto; }
+  header { text-align: center; margin-bottom: 28px; }
+  header h1 { font-size: 1.7em; font-weight: normal; letter-spacing: .02em; }
+  header p { color: var(--muted); font-size: .95em; margin-top: 6px; font-style: italic; }
+
+  form {
+    display: flex; gap: 8px;
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 14px;
+    padding: 8px;
+    box-shadow: 0 2px 10px rgba(120, 90, 60, .06);
+  }
+  input {
+    flex: 1; border: none; outline: none; background: transparent;
+    font: inherit; font-size: 1.1em; padding: 8px 10px; color: var(--ink);
+  }
+  input::placeholder { color: var(--muted); }
+  button {
+    border: none; border-radius: 10px;
+    background: var(--accent); color: #fff;
+    font: inherit; font-size: 1em;
+    padding: 10px 22px; cursor: pointer;
+    transition: opacity .15s;
+  }
+  button:disabled { opacity: .5; cursor: default; }
+
+  .status { text-align: center; color: var(--muted); margin: 18px 0; min-height: 1.4em; font-style: italic; }
+  .status.error { color: #b0503c; }
+
+  .card {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 14px;
+    padding: 22px 24px;
+    margin-top: 18px;
+    box-shadow: 0 2px 10px rgba(120, 90, 60, .06);
+    line-height: 1.65;
+    font-size: 1.02em;
+    animation: fadein .3s ease;
+    overflow-wrap: break-word;
+  }
+  @keyframes fadein { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; } }
+  .card b { color: var(--accent); }
+  .card .lvl { letter-spacing: .05em; }
+  .card hr { border: none; border-top: 1px dashed var(--border); margin: 10px 0; }
+
+  .spinner {
+    display: inline-block; width: 14px; height: 14px;
+    border: 2px solid var(--accent-soft); border-top-color: var(--accent);
+    border-radius: 50%; animation: spin .8s linear infinite;
+    vertical-align: -2px; margin-right: 8px;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+
+  footer { text-align: center; color: var(--muted); font-size: .85em; margin-top: 42px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>📖 Словарик</h1>
+    <p>введи английское слово или выражение — получишь полный разбор</p>
+  </header>
+
+  <form id="form">
+    <input id="q" type="text" placeholder="например: handle, get along with…"
+           autocomplete="off" autofocus maxlength="80">
+    <button id="go" type="submit">Разобрать</button>
+  </form>
+
+  <div class="status" id="status"></div>
+  <div id="results"></div>
+
+  <footer>сделано с любовью ♥</footer>
+</div>
+
+<script>
+const API = 'https://198-46-253-50.sslip.io:8978/word';
+const TOKEN = '162ffe8e282a1dfb7c2963fcaae68f9e';
+
+const form = document.getElementById('form');
+const q = document.getElementById('q');
+const go = document.getElementById('go');
+const statusEl = document.getElementById('status');
+const results = document.getElementById('results');
+
+// мини-рендер markdown: экранируем HTML, потом **жирный**, *курсив*, переносы
+function mdToHtml(md) {
+  let h = md
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    .replace(/^#+\s*(.+)$/gm, '**$1**')
+    .replace(/\*\*([^*]+)\*\*/g, '<b>$1</b>')
+    .replace(/\*([^*\n]+)\*/g, '<i>$1</i>')
+    .replace(/^---+$/gm, '<hr>');
+  return h.split(/\n{2,}/).map(p => '<p>' + p.replace(/\n/g, '<br>') + '</p>').join('');
+}
+
+function setStatus(text, isError, spin) {
+  statusEl.className = 'status' + (isError ? ' error' : '');
+  statusEl.innerHTML = (spin ? '<span class="spinner"></span>' : '') + text;
+}
+
+async function lookup(text) {
+  go.disabled = true; q.disabled = true;
+  setStatus('думаю над словом…', false, true);
+  try {
+    const r = await fetch(API, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Auth-Token': TOKEN },
+      body: JSON.stringify({ text })
+    });
+    if (r.status === 429) { setStatus('сервер занят — подожди пару секунд и попробуй ещё раз', true); return; }
+    if (!r.ok) { setStatus('ошибка сервера (' + r.status + ') — попробуй позже', true); return; }
+    const data = await r.json();
+    const card = document.createElement('div');
+    card.className = 'card';
+    card.innerHTML = mdToHtml(data.text);
+    results.prepend(card);
+    setStatus('');
+    q.value = '';
+  } catch (e) {
+    setStatus('нет связи с сервером — проверь интернет', true);
+  } finally {
+    go.disabled = false; q.disabled = false; q.focus();
+  }
+}
+
+form.addEventListener('submit', ev => {
+  ev.preventDefault();
+  const text = q.value.trim();
+  if (text) lookup(text);
+});
+</script>
+</body>
+</html>
