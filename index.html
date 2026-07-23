@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Словарик · разбор английских слов</title>
+<title>Словарик для кисы · разбор английских слов</title>
 <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>📖</text></svg>">
 <style>
   :root {
@@ -70,6 +70,19 @@
   .card .lvl { letter-spacing: .05em; }
   .card hr { border: none; border-top: 1px dashed var(--border); margin: 10px 0; }
 
+  /* скрытый перевод: размытая «пилюля», открывается по тапу */
+  .tr {
+    display: inline-block;
+    background: var(--accent-soft);
+    border-radius: 8px;
+    padding: 0 8px;
+    cursor: pointer;
+    user-select: none;
+    filter: blur(5px);
+    transition: filter .2s;
+  }
+  .tr.open { filter: none; cursor: default; user-select: text; }
+
   .spinner {
     display: inline-block; width: 14px; height: 14px;
     border: 2px solid var(--accent-soft); border-top-color: var(--accent);
@@ -84,7 +97,7 @@
 <body>
 <div class="wrap">
   <header>
-    <h1>📖 Словарик</h1>
+    <h1>📖 Словарик для кисы</h1>
     <p>введи английское слово или выражение — получишь полный разбор</p>
   </header>
 
@@ -110,16 +123,24 @@ const go = document.getElementById('go');
 const statusEl = document.getElementById('status');
 const results = document.getElementById('results');
 
-// мини-рендер markdown: экранируем HTML, потом **жирный**, *курсив*, переносы
+// мини-рендер markdown: экранируем HTML, потом **жирный**, *курсив*,
+// {{перевод}} -> скрытая пилюля, переносы
 function mdToHtml(md) {
   let h = md
     .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
     .replace(/^#+\s*(.+)$/gm, '**$1**')
+    .replace(/\{\{([^{}]+)\}\}/g, '<span class="tr" title="показать перевод">$1</span>')
     .replace(/\*\*([^*]+)\*\*/g, '<b>$1</b>')
     .replace(/\*([^*\n]+)\*/g, '<i>$1</i>')
     .replace(/^---+$/gm, '<hr>');
   return h.split(/\n{2,}/).map(p => '<p>' + p.replace(/\n/g, '<br>') + '</p>').join('');
 }
+
+// открытие переводов по тапу
+document.addEventListener('click', ev => {
+  const t = ev.target.closest('.tr');
+  if (t) t.classList.add('open');
+});
 
 function setStatus(text, isError, spin) {
   statusEl.className = 'status' + (isError ? ' error' : '');
