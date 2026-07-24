@@ -108,6 +108,13 @@
   .tr.open { filter: none; cursor: default; user-select: text; }
 
   /* словарь по главе */
+  .stats { margin-bottom: 10px; }
+  .srow { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; flex-wrap: wrap; }
+  .srow .slvl { min-width: 54px; }
+  .srow .balls { font-size: .8em; letter-spacing: 1px; }
+  .srow .sn { color: var(--muted); white-space: nowrap; }
+  .tlevel { margin-bottom: 14px; font-size: 1.05em; }
+  .tlevel b { color: var(--accent); }
   .chips { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 14px; }
   .chip {
     background: var(--accent-soft);
@@ -296,15 +303,26 @@ function renderDict(raw) {
   const counts = {};
   for (const w of words) if (w.lvl) counts[w.lvl] = (counts[w.lvl] || 0) + 1;
 
-  let html = '<div class="dcount">всего слов: ' + words.length + '</div>';
-  html += '<div class="chips">';
+  const total = words.length;
+  let html = '<div class="stats">';
   for (const l of LVL_ORDER) {
-    if (counts[l]) {
-      html += '<span class="chip">' + LVL[l] + ' <b>' + l + '</b> — <span class="n">'
-            + counts[l] + '</span></span>';
-    }
+    if (!counts[l]) continue;
+    const pct = counts[l] / total * 100;
+    const filled = Math.min(10, Math.max(1, Math.round(pct / 10)));  // 1 шарик = 10%
+    html += '<div class="srow"><span class="slvl">' + LVL[l] + ' <b>' + l + '</b></span>'
+          + '<span class="balls">' + LVL[l].repeat(filled) + '⚪'.repeat(10 - filled) + '</span>'
+          + '<span class="sn">' + Math.round(pct) + '% — ' + counts[l] + ' шт</span></div>';
   }
-  html += '</div><table class="dict">';
+  html += '</div>';
+  html += '<div class="dcount">Всего слов: ' + total + '</div>';
+  // уровень текста = уровень, ниже которого лежит ~80% слов (медиана всегда
+  // проседает к A2 из-за служебной базовой лексики любого текста)
+  const idxs = words.map(w => LVL_ORDER.indexOf(w.lvl)).filter(i => i >= 0).sort((a, b) => a - b);
+  if (idxs.length) {
+    const tl = LVL_ORDER[idxs[Math.min(idxs.length - 1, Math.floor(idxs.length * 0.8))]];
+    html += '<div class="tlevel">Уровень текста: <b>' + tl + '</b> ' + LVL[tl] + '</div>';
+  }
+  html += '<table class="dict">';
   for (const w of words) {
     const ipa = w.ipa ? '<br><span class="ipa">/' + esc(w.ipa.replace(/^\/|\/$/g, '')) + '/</span>' : '';
     html += '<tr>'
