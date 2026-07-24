@@ -5,7 +5,8 @@
 
 Устройство как у langme-llm:
 - только haiku (дешёвая модель, экономим квоту подписки);
-- один запрос одновременно (asyncio lock) -> 429 когда занято;
+- раздельные локи слова/главы: одно слово + одна глава одновременно,
+  слова ждут очереди до 120с (до 3 в очереди), дальше 429;
 - дисковый кэш по нормализованному слову (повторные запросы бесплатны);
 - простой per-IP rate limit;
 - статичный токен в X-Auth-Token (лежит в JS сайта — защита от сканеров портов,
@@ -47,7 +48,12 @@ app.add_middleware(
     allow_headers=["X-Auth-Token", "Content-Type"],
 )
 
-lock = asyncio.Lock()
+# Раздельные локи: длинная «Глава» (до 7 мин) не должна блокировать слова.
+# Максимум 2 процесса claude одновременно (1 слово + 1 глава) — больше 2ГБ VPS не потянет.
+word_lock = asyncio.Lock()
+chapter_lock = asyncio.Lock()
+_word_waiters = 0
+WORD_QUEUE_MAX = 3  # 1 активный + 2 ждут; дальше честный 429
 _hits: dict[str, deque] = defaultdict(deque)
 
 TEMPLATE = """Обрабатывай английское слово или выражение по данному шаблону. \
@@ -201,10 +207,22 @@ async def word(req: WordReq, request: Request,
 
     ip = request.client.host if request.client else "?"
     check_rate(ip)
-    if lock.locked():
+    # ждём своей очереди вместо мгновенного 429 (фронт и так крутит спиннер)
+    global _word_waiters
+    if _word_waiters >= WORD_QUEUE_MAX:
         raise HTTPException(429, "busy, retry in a few seconds")
-    async with lock:
-        answer = await asyncio.to_thread(run_claude, TEMPLATE + text)
+    _word_waiters += 1
+    try:
+        try:
+            await asyncio.wait_for(word_lock.acquire(), timeout=120)
+        except asyncio.TimeoutError:
+            raise HTTPException(429, "busy, retry in a few seconds")
+        try:
+            answer = await asyncio.to_thread(run_claude, TEMPLATE + text)
+        finally:
+            word_lock.release()
+    finally:
+        _word_waiters -= 1
     p.write_text(answer)
     return {"text": answer, "cached": False}
 
@@ -230,9 +248,9 @@ async def chapter(req: WordReq, request: Request,
 
     ip = request.client.host if request.client else "?"
     check_rate(ip)
-    if lock.locked():
+    if chapter_lock.locked():
         raise HTTPException(429, "busy, retry in a few seconds")
-    async with lock:
+    async with chapter_lock:
         answer = await asyncio.to_thread(
             run_claude, CHAPTER_TEMPLATE + text, CHAPTER_TIMEOUT_S
         )
