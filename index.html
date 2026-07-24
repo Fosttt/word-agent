@@ -28,6 +28,20 @@
   header h1 { font-size: 1.7em; font-weight: normal; letter-spacing: .02em; }
   header p { color: var(--muted); font-size: .95em; margin-top: 6px; font-style: italic; }
 
+  .seg {
+    display: flex; gap: 4px;
+    background: var(--accent-soft);
+    border-radius: 12px;
+    padding: 4px;
+    margin: 0 auto 16px;
+    width: fit-content;
+  }
+  .seg button {
+    background: transparent; color: var(--ink);
+    padding: 8px 20px; border-radius: 9px;
+  }
+  .seg button.on { background: var(--accent); color: #fff; }
+
   form {
     display: flex; gap: 8px;
     background: var(--card);
@@ -36,6 +50,16 @@
     padding: 8px;
     box-shadow: 0 2px 10px rgba(120, 90, 60, .06);
   }
+  #chform { flex-direction: column; }
+  textarea {
+    border: none; outline: none; background: transparent;
+    font: inherit; font-size: 1em; padding: 8px 10px; color: var(--ink);
+    min-height: 180px; resize: vertical;
+  }
+  textarea::placeholder { color: var(--muted); }
+  #chform button { align-self: flex-end; }
+  .hint { color: var(--muted); font-size: .85em; padding: 0 10px 4px; font-style: italic; }
+  .hidden { display: none !important; }
   input {
     flex: 1; border: none; outline: none; background: transparent;
     font: inherit; font-size: 1.1em; padding: 8px 10px; color: var(--ink);
@@ -83,6 +107,40 @@
   }
   .tr.open { filter: none; cursor: default; user-select: text; }
 
+  /* словарь по главе */
+  .chips { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 14px; }
+  .chip {
+    background: var(--accent-soft);
+    border-radius: 999px;
+    padding: 4px 12px;
+    font-size: .92em;
+    white-space: nowrap;
+  }
+  .chip b { color: var(--ink); }
+  .chip .n { color: var(--accent); font-weight: bold; }
+  .dict { width: 100%; border-collapse: collapse; }
+  .dict td {
+    padding: 9px 8px;
+    border-top: 1px dashed var(--border);
+    vertical-align: top;
+  }
+  .dict tr:first-child td { border-top: none; }
+  .dict .w { font-weight: bold; color: var(--accent); }
+  .dict .ipa { color: var(--muted); font-size: .88em; font-family: 'Segoe UI', Arial, sans-serif; }
+  .dict .pos {
+    display: inline-block;
+    background: var(--accent-soft);
+    border-radius: 6px;
+    padding: 0 7px;
+    font-size: .78em;
+    font-style: italic;
+    color: var(--ink);
+    white-space: nowrap;
+  }
+  .dict .ru { }
+  .dict .lv { white-space: nowrap; font-size: .9em; }
+  .dcount { color: var(--muted); font-style: italic; margin-bottom: 10px; }
+
   .spinner {
     display: inline-block; width: 14px; height: 14px;
     border: 2px solid var(--accent-soft); border-top-color: var(--accent);
@@ -98,13 +156,25 @@
 <div class="wrap">
   <header>
     <h1>📖 Словарик для кисы</h1>
-    <p>введи английское слово или выражение — получишь полный разбор</p>
+    <p id="subtitle">введи английское слово или выражение — получишь полный разбор</p>
   </header>
+
+  <div class="seg">
+    <button type="button" id="modeWord" class="on">Слово</button>
+    <button type="button" id="modeChapter">Глава</button>
+  </div>
 
   <form id="form">
     <input id="q" type="text" placeholder="например: handle, get along with…"
            autocomplete="off" autofocus maxlength="80">
     <button id="go" type="submit">Разобрать</button>
+  </form>
+
+  <form id="chform" class="hidden">
+    <textarea id="chq" maxlength="20000"
+      placeholder="вставь сюда текст главы на английском…"></textarea>
+    <div class="hint">до 20 000 символов; словарь готовится 1–3 минуты</div>
+    <button id="chgo" type="submit">Составить словарь</button>
   </form>
 
   <div class="status" id="status"></div>
@@ -114,14 +184,39 @@
 </div>
 
 <script>
-const API = 'https://198-46-253-50.sslip.io:8978/word';
+const API_BASE = 'https://198-46-253-50.sslip.io:8978';
+const API = API_BASE + '/word';
+const API_CHAPTER = API_BASE + '/chapter';
 const TOKEN = '162ffe8e282a1dfb7c2963fcaae68f9e';
 
 const form = document.getElementById('form');
 const q = document.getElementById('q');
 const go = document.getElementById('go');
+const chform = document.getElementById('chform');
+const chq = document.getElementById('chq');
+const chgo = document.getElementById('chgo');
+const modeWord = document.getElementById('modeWord');
+const modeChapter = document.getElementById('modeChapter');
+const subtitle = document.getElementById('subtitle');
 const statusEl = document.getElementById('status');
 const results = document.getElementById('results');
+
+const LVL = { A1: '🟢', A2: '🟡', B1: '🔵', B2: '🟣', C1: '🟠', C2: '🔴' };
+const LVL_ORDER = ['A1', 'A2', 'B1', 'B2', 'C1', 'C2'];
+
+function setMode(chapterMode) {
+  modeWord.classList.toggle('on', !chapterMode);
+  modeChapter.classList.toggle('on', chapterMode);
+  form.classList.toggle('hidden', chapterMode);
+  chform.classList.toggle('hidden', !chapterMode);
+  subtitle.textContent = chapterMode
+    ? 'вставь главу книги — получишь словарь всех слов с уровнями'
+    : 'введи английское слово или выражение — получишь полный разбор';
+  setStatus('');
+  (chapterMode ? chq : q).focus();
+}
+modeWord.addEventListener('click', () => setMode(false));
+modeChapter.addEventListener('click', () => setMode(true));
 
 // мини-рендер markdown: экранируем HTML, потом **жирный**, *курсив*,
 // {{перевод}} -> скрытая пилюля, переносы
@@ -176,6 +271,88 @@ form.addEventListener('submit', ev => {
   ev.preventDefault();
   const text = q.value.trim();
   if (text) lookup(text);
+});
+
+// ---- режим «Глава»: словарь всех слов главы ----
+
+function esc(s) {
+  return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
+// парсим строки "слово | ipa | часть речи | перевод | уровень"
+function renderDict(raw) {
+  const words = [];
+  for (const line of raw.split('\n')) {
+    const parts = line.split('|').map(s => s.trim());
+    if (parts.length < 4 || !parts[0]) continue;
+    const lvl = (parts[4] || '').toUpperCase().match(/[ABC][12]/);
+    words.push({
+      w: parts[0], ipa: parts[1] || '', pos: parts[2] || '',
+      ru: parts[3] || '', lvl: lvl ? lvl[0] : ''
+    });
+  }
+  if (!words.length) return null;
+
+  const counts = {};
+  for (const w of words) if (w.lvl) counts[w.lvl] = (counts[w.lvl] || 0) + 1;
+
+  let html = '<div class="dcount">всего слов: ' + words.length + '</div>';
+  html += '<div class="chips">';
+  for (const l of LVL_ORDER) {
+    if (counts[l]) {
+      html += '<span class="chip">' + LVL[l] + ' <b>' + l + '</b> — <span class="n">'
+            + counts[l] + '</span></span>';
+    }
+  }
+  html += '</div><table class="dict">';
+  for (const w of words) {
+    const ipa = w.ipa ? '<br><span class="ipa">/' + esc(w.ipa.replace(/^\/|\/$/g, '')) + '/</span>' : '';
+    html += '<tr>'
+      + '<td><span class="lv">' + (LVL[w.lvl] || '⚪') + '</span> '
+      + '<span class="w">' + esc(w.w) + '</span>' + ipa + '</td>'
+      + '<td><span class="pos">' + esc(w.pos) + '</span></td>'
+      + '<td class="ru">' + esc(w.ru) + '</td>'
+      + '</tr>';
+  }
+  html += '</table>';
+  return html;
+}
+
+async function lookupChapter(text) {
+  chgo.disabled = true; chq.disabled = true;
+  setStatus('составляю словарь — это может занять 1–3 минуты…', false, true);
+  try {
+    const r = await fetch(API_CHAPTER, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Auth-Token': TOKEN },
+      body: JSON.stringify({ text })
+    });
+    if (r.status === 429) { setStatus('сервер занят — подожди немного и попробуй ещё раз', true); return; }
+    if (r.status === 400) {
+      let msg = 'слишком длинный текст — разбей главу на части';
+      try { msg = (await r.json()).detail || msg; } catch (e) {}
+      setStatus(msg, true); return;
+    }
+    if (!r.ok) { setStatus('ошибка сервера (' + r.status + ') — попробуй позже', true); return; }
+    const data = await r.json();
+    const html = renderDict(data.text);
+    if (!html) { setStatus('не получилось разобрать ответ — попробуй ещё раз', true); return; }
+    const card = document.createElement('div');
+    card.className = 'card';
+    card.innerHTML = html;
+    results.prepend(card);
+    setStatus('');
+  } catch (e) {
+    setStatus('нет связи с сервером — проверь интернет', true);
+  } finally {
+    chgo.disabled = false; chq.disabled = false;
+  }
+}
+
+chform.addEventListener('submit', ev => {
+  ev.preventDefault();
+  const text = chq.value.trim();
+  if (text) lookupChapter(text);
 });
 </script>
 </body>

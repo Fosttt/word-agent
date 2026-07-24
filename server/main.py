@@ -28,6 +28,8 @@ TOKEN = os.environ.get("WORD_AGENT_TOKEN", "")
 MODEL = os.environ.get("WORD_AGENT_MODEL", "haiku")
 CLAUDE_BIN = os.environ.get("WORD_AGENT_CLAUDE_BIN", "claude")
 TIMEOUT_S = int(os.environ.get("WORD_AGENT_TIMEOUT", "90"))
+CHAPTER_TIMEOUT_S = int(os.environ.get("WORD_AGENT_CHAPTER_TIMEOUT", "420"))
+CHAPTER_MAX_CHARS = int(os.environ.get("WORD_AGENT_CHAPTER_MAX", "20000"))
 CACHE_DIR = Path(os.environ.get("WORD_AGENT_CACHE", "~/.cache/word_agent")).expanduser()
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -102,6 +104,32 @@ Obsolete ☠️ | Limited Use ⚠️ | Current ✅ (укажи один, обя�
 Слово или выражение для разбора:
 """
 
+CHAPTER_TEMPLATE = """Составь учебный словарь по тексту главы книги на английском.
+
+Выпиши ВСЕ уникальные значимые слова: существительные, глаголы, прилагательные, \
+наречия и полезные устойчивые выражения. Исключи артикли, предлоги, союзы, \
+местоимения, вспомогательные глаголы, числительные и имена собственные \
+(имена людей, названия мест).
+
+Каждое слово приведи в начальной форме (лемме): существительные в единственном \
+числе, глаголы в инфинитиве без to. Каждое слово — только один раз. \
+Отсортируй по алфавиту.
+
+Ответ — ТОЛЬКО строки такого формата, по одной на слово, без заголовков, \
+нумерации, markdown и любых пояснений:
+слово | транскрипция IPA | часть речи | перевод | уровень
+
+Часть речи по-английски: noun, verb, adjective, adverb, phrase, idiom и т.п.
+Перевод — краткий, по-русски, в контексте употребления в этой главе.
+Уровень — строго один из: A1, A2, B1, B2, C1, C2.
+
+Пример строк:
+abandon | əˈbændən | verb | покидать, бросать | B2
+brave | breɪv | adjective | смелый | A2
+
+Текст главы:
+"""
+
 
 def check_token(token: str | None):
     if not TOKEN:
@@ -124,7 +152,7 @@ def cache_path(key: str) -> Path:
     return CACHE_DIR / (hashlib.sha256(key.encode()).hexdigest() + ".md")
 
 
-def run_claude(prompt: str) -> str:
+def run_claude(prompt: str, timeout_s: int = TIMEOUT_S) -> str:
     # промпт через stdin + запрет инструментов: prompt-injection в запросе не
     # сможет заставить claude читать файлы или выполнять команды на сервере
     try:
@@ -133,7 +161,7 @@ def run_claude(prompt: str) -> str:
             input=prompt,
             capture_output=True,
             text=True,
-            timeout=TIMEOUT_S,
+            timeout=timeout_s,
         )
     except subprocess.TimeoutExpired:
         raise HTTPException(504, "LLM timeout")
@@ -177,5 +205,36 @@ async def word(req: WordReq, request: Request,
         raise HTTPException(429, "busy, retry in a few seconds")
     async with lock:
         answer = await asyncio.to_thread(run_claude, TEMPLATE + text)
+    p.write_text(answer)
+    return {"text": answer, "cached": False}
+
+
+@app.post("/chapter")
+async def chapter(req: WordReq, request: Request,
+                  x_auth_token: str | None = Header(default=None)):
+    check_token(x_auth_token)
+    text = req.text.strip()
+    if not text:
+        raise HTTPException(400, "empty request")
+    if len(text) > CHAPTER_MAX_CHARS:
+        raise HTTPException(
+            400,
+            f"chapter too long ({len(text)} chars, max {CHAPTER_MAX_CHARS}) — "
+            "разбей главу на части",
+        )
+
+    key = "chapter:" + text.lower()
+    p = cache_path(key)
+    if p.exists():
+        return {"text": p.read_text(), "cached": True}
+
+    ip = request.client.host if request.client else "?"
+    check_rate(ip)
+    if lock.locked():
+        raise HTTPException(429, "busy, retry in a few seconds")
+    async with lock:
+        answer = await asyncio.to_thread(
+            run_claude, CHAPTER_TEMPLATE + text, CHAPTER_TIMEOUT_S
+        )
     p.write_text(answer)
     return {"text": answer, "cached": False}
