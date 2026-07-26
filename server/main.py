@@ -316,6 +316,14 @@ def cache_path(key: str) -> Path:
     return CACHE_DIR / (hashlib.sha256(key.encode()).hexdigest() + ".md")
 
 
+# без автообновлений и телеметрии CLI стартует на пару секунд быстрее;
+# thinking выключен — шаблоны механические, размышления только тянут время
+CLAUDE_ENV = {**os.environ,
+              "DISABLE_AUTOUPDATER": "1",
+              "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
+              "MAX_THINKING_TOKENS": "0"}
+
+
 def run_claude(prompt: str, timeout_s: int = TIMEOUT_S) -> str:
     # промпт через stdin + запрет инструментов: prompt-injection в запросе не
     # сможет заставить claude читать файлы или выполнять команды на сервере
@@ -326,6 +334,7 @@ def run_claude(prompt: str, timeout_s: int = TIMEOUT_S) -> str:
             capture_output=True,
             text=True,
             timeout=timeout_s,
+            env=CLAUDE_ENV,
         )
     except subprocess.TimeoutExpired:
         raise HTTPException(504, "LLM timeout")
@@ -342,6 +351,50 @@ def run_claude(prompt: str, timeout_s: int = TIMEOUT_S) -> str:
 async def run_claude_async(prompt: str, timeout_s: int = TIMEOUT_S) -> str:
     async with claude_sem:
         return await asyncio.to_thread(run_claude, prompt, timeout_s)
+
+
+async def stream_claude(prompt: str, timeout_s: int = TIMEOUT_S):
+    """Генератор ('delta', кусок) … ('result', полный текст) из stream-json."""
+    proc = await asyncio.create_subprocess_exec(
+        CLAUDE_BIN, "-p", "--model", MODEL, "--disallowedTools", "*",
+        "--output-format", "stream-json", "--include-partial-messages",
+        "--verbose",
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.DEVNULL,
+        env=CLAUDE_ENV,
+    )
+    try:
+        proc.stdin.write(prompt.encode())
+        await proc.stdin.drain()
+        proc.stdin.close()
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout_s
+        while True:
+            left = deadline - loop.time()
+            if left <= 0:
+                raise HTTPException(504, "LLM timeout")
+            line = await asyncio.wait_for(proc.stdout.readline(), timeout=left)
+            if not line:
+                break
+            try:
+                obj = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if obj.get("type") == "stream_event":
+                ev = obj.get("event") or {}
+                if ev.get("type") == "content_block_delta":
+                    d = ev.get("delta") or {}
+                    if d.get("type") == "text_delta" and d.get("text"):
+                        yield "delta", d["text"]
+            elif obj.get("type") == "result":
+                res = obj.get("result")
+                if isinstance(res, str) and res.strip():
+                    yield "result", res.strip()
+        await proc.wait()
+    finally:
+        if proc.returncode is None:
+            proc.kill()
 
 
 class WordReq(BaseModel):
@@ -393,6 +446,68 @@ async def word(req: WordReq, request: Request,
         _word_waiters -= 1
     p.write_text(answer)
     return {"text": answer, "cached": False}
+
+
+@app.post("/word2")
+async def word2(req: WordReq, request: Request,
+                x_auth_token: str | None = Header(default=None)):
+    """Стриминг разбора слова NDJSON: delta… → done (или error)."""
+    check_token(x_auth_token)
+    text = " ".join(req.text.split()).strip()
+    if not text:
+        raise HTTPException(400, "empty request")
+    if len(text) > 80:
+        raise HTTPException(400, "too long — one word or phrase, please")
+
+    def j(**obj):
+        return json.dumps(obj, ensure_ascii=False) + "\n"
+
+    key = text.lower()
+    p = cache_path(key)
+    if p.exists():
+        return StreamingResponse(
+            iter([j(type="delta", text=p.read_text()) + j(type="done")]),
+            media_type="application/x-ndjson")
+
+    ip = request.client.host if request.client else "?"
+    check_rate(ip)
+    if _word_waiters >= WORD_QUEUE_MAX:
+        raise HTTPException(429, "busy, retry in a few seconds")
+
+    async def gen():
+        global _word_waiters
+        _word_waiters += 1
+        try:
+            try:
+                await asyncio.wait_for(word_lock.acquire(), timeout=120)
+            except asyncio.TimeoutError:
+                yield j(type="error", detail="сервер занят — попробуй ещё раз через минуту")
+                return
+            try:
+                async with claude_sem:
+                    full, result = [], None
+                    async for kind, chunk in stream_claude(TEMPLATE + text):
+                        if kind == "delta":
+                            full.append(chunk)
+                            yield j(type="delta", text=chunk)
+                        else:
+                            result = chunk
+                    answer = result or "".join(full).strip()
+                    if not answer:
+                        yield j(type="error", detail="пустой ответ — попробуй ещё раз")
+                        return
+                    p.write_text(answer)
+                    yield j(type="done")
+            finally:
+                word_lock.release()
+        except HTTPException as e:
+            yield j(type="error", detail=str(e.detail))
+        except Exception as e:
+            yield j(type="error", detail=f"внутренняя ошибка: {e}")
+        finally:
+            _word_waiters -= 1
+
+    return StreamingResponse(gen(), media_type="application/x-ndjson")
 
 
 # ---- глава ------------------------------------------------------------------

@@ -192,7 +192,7 @@
 
 <script>
 const API_BASE = 'https://198-46-253-50.sslip.io';
-const API = API_BASE + '/word';
+const API = API_BASE + '/word2';
 const API_CHAPTER = API_BASE + '/chapter2';
 const TOKEN = '162ffe8e282a1dfb7c2963fcaae68f9e';
 
@@ -255,6 +255,7 @@ function setStatus(text, isError, spin) {
 async function lookup(text) {
   go.disabled = true; q.disabled = true;
   setStatus('думаю над словом…', false, true);
+  let card = null, acc = '', errMsg = null;
   try {
     const r = await fetch(API, {
       method: 'POST',
@@ -263,11 +264,21 @@ async function lookup(text) {
     });
     if (r.status === 429) { setStatus('сервер занят — подожди пару секунд и попробуй ещё раз', true); return; }
     if (!r.ok) { setStatus('ошибка сервера (' + r.status + ') — попробуй позже', true); return; }
-    const data = await r.json();
-    const card = document.createElement('div');
-    card.className = 'card m-word';
-    card.innerHTML = mdToHtml(data.text);
-    results.prepend(card);
+    await readNdjson(r, ev => {
+      if (ev.type === 'delta') {
+        acc += ev.text;
+        if (!card) {
+          card = document.createElement('div');
+          card.className = 'card m-word';
+          results.prepend(card);
+        }
+        card.innerHTML = mdToHtml(acc);
+      } else if (ev.type === 'error') {
+        errMsg = ev.detail || 'ошибка сервера';
+      }
+    });
+    if (errMsg) { if (card) card.remove(); setStatus(errMsg, true); return; }
+    if (!acc.trim()) { setStatus('пустой ответ — попробуй ещё раз', true); return; }
     setStatus('');
     q.value = '';
   } catch (e) {
