@@ -220,6 +220,9 @@ function setMode(chapterMode) {
     ? 'вставь главу книги — получишь словарь всех слов с уровнями'
     : 'введи английское слово или выражение — получишь полный разбор';
   setStatus('');
+  // каждый режим показывает только свои карточки
+  results.querySelectorAll('.m-word').forEach(el => el.classList.toggle('hidden', chapterMode));
+  results.querySelectorAll('.m-chapter').forEach(el => el.classList.toggle('hidden', !chapterMode));
   (chapterMode ? chq : q).focus();
 }
 modeWord.addEventListener('click', () => setMode(false));
@@ -262,7 +265,7 @@ async function lookup(text) {
     if (!r.ok) { setStatus('ошибка сервера (' + r.status + ') — попробуй позже', true); return; }
     const data = await r.json();
     const card = document.createElement('div');
-    card.className = 'card';
+    card.className = 'card m-word';
     card.innerHTML = mdToHtml(data.text);
     results.prepend(card);
     setStatus('');
@@ -388,7 +391,7 @@ async function lookupChapter(text) {
     if (!html) return;
     if (!card) {
       card = document.createElement('div');
-      card.className = 'card';
+      card.className = 'card m-chapter';
       results.prepend(card);
     }
     card.innerHTML = html;
