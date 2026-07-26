@@ -5,17 +5,32 @@
 
 Устройство как у langme-llm:
 - только haiku (дешёвая модель, экономим квоту подписки);
-- раздельные локи слова/главы: одно слово + одна глава одновременно,
-  слова ждут очереди до 120с (до 3 в очереди), дальше 429;
+- глобальный семафор на 2 процесса claude (больше 2ГБ VPS не потянет);
 - дисковый кэш по нормализованному слову (повторные запросы бесплатны);
 - простой per-IP rate limit;
 - статичный токен в X-Auth-Token (лежит в JS сайта — защита от сканеров портов,
   не от целенаправленного злоумышленника).
+
+Режим «Глава» (переделан 26.07 — «прорыв» по скорости):
+- слова из главы выделяет САМ СЕРВЕР (токенизация + стоп-слова + отсев имён
+  собственных + лемматизация simplemma), LLM главу больше не читает и ничего
+  не решает про состав словаря;
+- вечный пословный кэш dict.jsonl: однажды переведённое слово никогда не
+  генерится заново — следующие главы той же книги почти мгновенны;
+- неизвестные слова уходят в claude мелкими батчами параллельно (семафор 2);
+- /chapter2 стримит NDJSON: кэшированные слова прилетают сразу, остальные —
+  по мере готовности батчей; при обрыве связи задача досчитывает и кладёт
+  всё в кэши, повторный запрос собирается из кэша;
+- отдельный вызов по полному тексту достаёт устойчивые выражения (output
+  маленький, поэтому быстрый);
+- /chapter оставлен как раньше (один JSON-ответ) для старых вкладок.
 """
 
 import asyncio
 import hashlib
+import json
 import os
+import re
 import subprocess
 import time
 from collections import defaultdict, deque
@@ -23,16 +38,19 @@ from pathlib import Path
 
 from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 TOKEN = os.environ.get("WORD_AGENT_TOKEN", "")
 MODEL = os.environ.get("WORD_AGENT_MODEL", "haiku")
 CLAUDE_BIN = os.environ.get("WORD_AGENT_CLAUDE_BIN", "claude")
 TIMEOUT_S = int(os.environ.get("WORD_AGENT_TIMEOUT", "90"))
-CHAPTER_TIMEOUT_S = int(os.environ.get("WORD_AGENT_CHAPTER_TIMEOUT", "420"))
+BATCH_TIMEOUT_S = int(os.environ.get("WORD_AGENT_BATCH_TIMEOUT", "240"))
+BATCH_SIZE = int(os.environ.get("WORD_AGENT_BATCH", "60"))
 CHAPTER_MAX_CHARS = int(os.environ.get("WORD_AGENT_CHAPTER_MAX", "20000"))
 CACHE_DIR = Path(os.environ.get("WORD_AGENT_CACHE", "~/.cache/word_agent")).expanduser()
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
+DICT_PATH = CACHE_DIR / "dict.jsonl"
 
 RATE_WINDOW_S = 60
 RATE_MAX = 10  # запросов с одного IP в минуту (кэш-хиты не считаются)
@@ -48,8 +66,10 @@ app.add_middleware(
     allow_headers=["X-Auth-Token", "Content-Type"],
 )
 
-# Раздельные локи: длинная «Глава» (до 7 мин) не должна блокировать слова.
-# Максимум 2 процесса claude одновременно (1 слово + 1 глава) — больше 2ГБ VPS не потянет.
+# Глобальный лимит: максимум 2 процесса claude одновременно (2ГБ VPS).
+# word_lock дополнительно держит очередь слов честной (по одному),
+# chapter_lock — одна глава за раз.
+claude_sem = asyncio.Semaphore(2)
 word_lock = asyncio.Lock()
 chapter_lock = asyncio.Lock()
 _word_waiters = 0
@@ -110,31 +130,167 @@ Obsolete ☠️ | Limited Use ⚠️ | Current ✅ (укажи один, обя�
 Слово или выражение для разбора:
 """
 
-CHAPTER_TEMPLATE = """Составь учебный словарь по тексту главы книги на английском.
+BATCH_TEMPLATE = """Для каждого английского слова из списка ниже выдай ровно \
+одну строку строго такого формата:
+слово | транскрипция IPA | часть речи | краткий русский перевод | уровень
 
-Выпиши ВСЕ уникальные значимые слова: существительные, глаголы, прилагательные, \
-наречия и полезные устойчивые выражения. Исключи артикли, предлоги, союзы, \
-местоимения, вспомогательные глаголы, числительные и имена собственные \
-(имена людей, названия мест).
+Правила:
+- слово в первой колонке — ровно как в списке, без изменений и без пропусков;
+- часть речи по-английски: noun, verb, adjective, adverb и т.п.;
+- перевод краткий: 1-3 самых употребимых значения через запятую;
+- уровень — строго один из: A1, A2, B1, B2, C1, C2;
+- если слово — имя собственное (имя, фамилия, название места, бренда), \
+вместо разбора выдай ровно: слово | - | name | - | -
 
-Каждое слово приведи в начальной форме (лемме): существительные в единственном \
-числе, глаголы в инфинитиве без to. Каждое слово — только один раз. \
-Отсортируй по алфавиту.
+Никаких заголовков, нумерации, markdown, пояснений и пустых строк — \
+только строки формата, по одной на каждое слово списка.
 
-Ответ — ТОЛЬКО строки такого формата, по одной на слово, без заголовков, \
-нумерации, markdown и любых пояснений:
-слово | транскрипция IPA | часть речи | перевод | уровень
+Список слов:
+"""
 
-Часть речи по-английски: noun, verb, adjective, adverb, phrase, idiom и т.п.
-Перевод — краткий, по-русски, в контексте употребления в этой главе.
-Уровень — строго один из: A1, A2, B1, B2, C1, C2.
+PHRASES_TEMPLATE = """Прочитай текст главы книги на английском и выпиши из \
+него 5-15 полезных для изучения устойчивых выражений, фразовых глаголов и \
+идиом — только те, что реально встречаются в этом тексте.
 
-Пример строк:
-abandon | əˈbændən | verb | покидать, бросать | B2
-brave | breɪv | adjective | смелый | A2
+Ответ — ТОЛЬКО строки такого формата, по одной на выражение, без заголовков, \
+нумерации, markdown и пояснений:
+выражение | транскрипция IPA | phrase | краткий русский перевод | уровень
+
+Уровень — строго один из: A1, A2, B1, B2, C1, C2. \
+Если подходящих выражений нет — верни пустой ответ.
 
 Текст главы:
 """
+
+# ---- локальное выделение слов из главы -------------------------------------
+
+# Только служебные слова (артикли, предлоги, союзы, местоимения,
+# вспомогательные/модальные глаголы, числительные) — значимые наречия
+# вроде very/just остаются в словаре, как и раньше делала модель.
+STOPWORDS = set("""
+a an the
+and or but nor so yet if then than because although though while whereas
+unless until once since as when whenever where wherever whether either neither
+both
+about above across after against along amid among around at before behind
+below beneath beside besides between beyond by despite down during except for
+from in inside into like near of off on onto out outside over past per through
+throughout till to toward towards under underneath up upon via with within
+without
+i you he she it we they me him her us them my your his its our their mine
+yours hers ours theirs myself yourself himself herself itself ourselves
+yourselves themselves this that these those who whom whose which what someone
+anyone everyone none nothing something anything everything somebody anybody
+everybody nobody one another each other any some all
+am is are was were be been being do does did doing done have has had having
+will would shall should can could may might must ought not
+don't doesn't didn't can't cannot won't wouldn't couldn't shouldn't isn't
+aren't wasn't weren't haven't hasn't hadn't mustn't needn't ain't let's i'm
+i've i'll i'd you're you've you'll you'd he's she's it's we're we've we'll
+we'd they're they've they'll they'd there's here's that's what's who's
+where's how's
+there here too yes no oh ah mr mrs ms dr
+two three four five six seven eight nine ten eleven twelve thirteen fourteen
+fifteen sixteen seventeen eighteen nineteen twenty thirty forty fifty sixty
+seventy eighty ninety hundred thousand million billion first second third
+""".split())
+
+WORD_RE = re.compile(r"[A-Za-z][A-Za-z'’\-]*")
+
+# формы, которые simplemma не сводит к базовой (went трактует как wend);
+# неоднозначные (felt/left/found…) не трогаем — модель даёт оба значения
+LEMMA_FIX = {"went": "go", "gone": "go"}
+
+
+def extract_words(text: str) -> list[str]:
+    """Уникальные значимые леммы главы, по алфавиту.
+
+    Имена собственные отсеиваются эвристикой: слово, которое встречается
+    с большой буквы НЕ в начале предложения и ни разу — со строчной.
+    """
+    import simplemma  # ленивый импорт: словарь en грузится при первой главе
+
+    tokens: list[tuple[str, bool]] = []  # (слово, стоит в начале предложения)
+    seen_lower: set[str] = set()
+    seen_cap_mid: set[str] = set()
+    for m in WORD_RE.finditer(text):
+        w = m.group(0).strip("'’-")
+        if len(w) < 2:
+            continue
+        before = text[: m.start()].rstrip(" \t")
+        at_start = not before or before[-1] in "\n.!?\"'“”‘’…"
+        tokens.append((w, at_start))
+        wl = w.lower()
+        if w[0].islower():
+            seen_lower.add(wl)
+        elif not at_start:
+            seen_cap_mid.add(wl)
+
+    out: set[str] = set()
+    for w, _ in tokens:
+        if w.isupper() and len(w) > 1:  # акронимы (OK, TV, USA)
+            continue
+        wl = w.lower()
+        if wl.endswith("'s") or wl.endswith("’s"):
+            wl = wl[:-2]
+        if "'" in wl or "’" in wl:  # прочие сокращения (o'clock и т.п.)
+            continue
+        if len(wl) < 2 or wl in STOPWORDS:
+            continue
+        if wl in seen_cap_mid and wl not in seen_lower:  # имя собственное
+            continue
+        lemma = LEMMA_FIX.get(wl) or simplemma.lemmatize(wl, lang="en")
+        if len(lemma) < 2 or lemma in STOPWORDS:
+            continue
+        out.add(lemma)
+    return sorted(out)
+
+
+# ---- вечный пословный кэш ---------------------------------------------------
+
+DICT: dict[str, str] = {}
+if DICT_PATH.exists():
+    for _line in DICT_PATH.read_text().splitlines():
+        try:
+            _rec = json.loads(_line)
+            DICT[_rec["w"]] = _rec["line"]
+        except (json.JSONDecodeError, KeyError):
+            continue
+
+
+def is_name(line: str) -> bool:
+    """Строка-маркер имени собственного (pos == name) — в словарь не идёт."""
+    parts = line.split("|")
+    return len(parts) > 2 and parts[2].strip() == "name"
+
+
+def dict_put(w: str, line: str):
+    if w in DICT:
+        return
+    DICT[w] = line
+    with DICT_PATH.open("a") as f:
+        f.write(json.dumps({"w": w, "line": line}, ensure_ascii=False) + "\n")
+
+
+def parse_dict_lines(raw: str, restrict: set[str] | None) -> dict[str, str]:
+    """Строки 'слово | ipa | pos | перевод | уровень' → {слово: строка}."""
+    out: dict[str, str] = {}
+    for line in raw.splitlines():
+        parts = [p.strip() for p in line.split("|")]
+        if len(parts) < 4 or not parts[0]:
+            continue
+        w = parts[0].strip("*#` ").lower()
+        if restrict is not None and w not in restrict:
+            continue
+        ipa = parts[1].strip("/") if len(parts) > 1 else ""
+        pos = parts[2] if len(parts) > 2 else ""
+        ru = parts[3] if len(parts) > 3 else ""
+        lvl = ""
+        if len(parts) > 4:
+            m = re.search(r"[ABC][12]", parts[4].upper())
+            lvl = m.group(0) if m else ""
+        out[w] = f"{w} | {ipa} | {pos} | {ru} | {lvl}"
+    return out
 
 
 def check_token(token: str | None):
@@ -181,13 +337,18 @@ def run_claude(prompt: str, timeout_s: int = TIMEOUT_S) -> str:
     return text
 
 
+async def run_claude_async(prompt: str, timeout_s: int = TIMEOUT_S) -> str:
+    async with claude_sem:
+        return await asyncio.to_thread(run_claude, prompt, timeout_s)
+
+
 class WordReq(BaseModel):
     text: str
 
 
 @app.get("/health")
 async def health():
-    return {"ok": True, "model": MODEL}
+    return {"ok": True, "model": MODEL, "dict_words": len(DICT)}
 
 
 @app.post("/word")
@@ -218,7 +379,7 @@ async def word(req: WordReq, request: Request,
         except asyncio.TimeoutError:
             raise HTTPException(429, "busy, retry in a few seconds")
         try:
-            answer = await asyncio.to_thread(run_claude, TEMPLATE + text)
+            answer = await run_claude_async(TEMPLATE + text)
         finally:
             word_lock.release()
     finally:
@@ -227,9 +388,97 @@ async def word(req: WordReq, request: Request,
     return {"text": answer, "cached": False}
 
 
-@app.post("/chapter")
-async def chapter(req: WordReq, request: Request,
-                  x_auth_token: str | None = Header(default=None)):
+# ---- глава ------------------------------------------------------------------
+
+async def chapter_job(text: str, cache_file: Path,
+                      q: asyncio.Queue | None) -> str:
+    """Собирает словарь главы; события прогресса кладёт в q (если дана).
+
+    Живёт как самостоятельная задача: если клиент отвалился, всё равно
+    досчитывает и пишет кэши — повторный запрос соберётся мгновенно.
+    """
+
+    async def emit(**obj):
+        if q is not None:
+            await q.put(obj)
+
+    try:
+        async with chapter_lock:
+            words = await asyncio.to_thread(extract_words, text)
+            if not words:
+                raise HTTPException(400, "не нашла английских слов в тексте")
+            known = [w for w in words if w in DICT and not is_name(DICT[w])]
+            cached_lines = [DICT[w] for w in known]
+            unknown = [w for w in words if w not in DICT]
+            await emit(type="meta", total=len(known) + len(unknown),
+                       cached=len(cached_lines))
+            lines = list(cached_lines)
+            if cached_lines:
+                await emit(type="lines", text="\n".join(cached_lines))
+
+            async def word_batch(batch: list[str]):
+                raw = await run_claude_async(
+                    BATCH_TEMPLATE + "\n".join(batch), BATCH_TIMEOUT_S)
+                return "word", parse_dict_lines(raw, restrict=set(batch))
+
+            async def phrases():
+                raw = await run_claude_async(
+                    PHRASES_TEMPLATE + text, BATCH_TIMEOUT_S)
+                res = parse_dict_lines(raw, restrict=None)
+                # модель путает колонку pos — принудительно ставим phrase
+                for w, line in res.items():
+                    parts = [p.strip() for p in line.split("|")]
+                    res[w] = f"{parts[0]} | {parts[1]} | phrase | {parts[3]} | {parts[4]}"
+                return "phrase", res
+
+            batches = [unknown[i:i + BATCH_SIZE]
+                       for i in range(0, len(unknown), BATCH_SIZE)]
+            # на паре предложений выражения искать нечего — не жжём квоту
+            tasks = [asyncio.create_task(phrases())] if len(text) >= 600 else []
+            tasks += [asyncio.create_task(word_batch(b)) for b in batches]
+
+            got: dict[str, str] = {}
+
+            async def collect(pending):
+                for fut in asyncio.as_completed(pending):
+                    try:
+                        kind, res = await fut
+                    except Exception:
+                        continue  # упавший батч добьём ретраем
+                    new = []
+                    for w, line in res.items():
+                        if kind == "word":
+                            if w in got:
+                                continue
+                            got[w] = line
+                            dict_put(w, line)
+                        if not is_name(line):
+                            new.append(line)
+                    if new:
+                        lines.extend(new)
+                        await emit(type="lines", text="\n".join(new))
+
+            await collect(tasks)
+            missing = [w for w in unknown if w not in got]
+            if missing:  # модель пропустила / батч упал — один ретрай
+                retry = [asyncio.create_task(word_batch(missing[i:i + BATCH_SIZE]))
+                         for i in range(0, len(missing), BATCH_SIZE)]
+                await collect(retry)
+
+            final = "\n".join(sorted(set(lines), key=str.lower))
+            cache_file.write_text(final)
+            await emit(type="done", words=len(set(lines)))
+            return final
+    except HTTPException as e:
+        await emit(type="error", detail=str(e.detail))
+        raise
+    except Exception as e:
+        await emit(type="error", detail=f"внутренняя ошибка: {e}")
+        raise
+
+
+def _chapter_validate(req: WordReq, request: Request,
+                      x_auth_token: str | None) -> tuple[str, Path]:
     check_token(x_auth_token)
     text = req.text.strip()
     if not text:
@@ -240,19 +489,56 @@ async def chapter(req: WordReq, request: Request,
             f"chapter too long ({len(text)} chars, max {CHAPTER_MAX_CHARS}) — "
             "разбей главу на части",
         )
+    return text, cache_path("chapter:" + text.lower())
 
-    key = "chapter:" + text.lower()
-    p = cache_path(key)
+
+@app.post("/chapter")
+async def chapter(req: WordReq, request: Request,
+                  x_auth_token: str | None = Header(default=None)):
+    """Старый интерфейс: один JSON-ответ целиком (для закэшированных вкладок)."""
+    text, p = _chapter_validate(req, request, x_auth_token)
     if p.exists():
         return {"text": p.read_text(), "cached": True}
+    ip = request.client.host if request.client else "?"
+    check_rate(ip)
+    if chapter_lock.locked():
+        raise HTTPException(429, "busy, retry in a few seconds")
+    answer = await chapter_job(text, p, None)
+    return {"text": answer, "cached": False}
+
+
+@app.post("/chapter2")
+async def chapter2(req: WordReq, request: Request,
+                   x_auth_token: str | None = Header(default=None)):
+    """Стриминг NDJSON: meta → lines… → done (или error)."""
+    text, p = _chapter_validate(req, request, x_auth_token)
+
+    def ndjson(*objs):
+        return "".join(json.dumps(o, ensure_ascii=False) + "\n" for o in objs)
+
+    if p.exists():
+        cached = p.read_text()
+        n = len(cached.splitlines())
+        return StreamingResponse(
+            iter([ndjson({"type": "meta", "total": n, "cached": n},
+                         {"type": "lines", "text": cached},
+                         {"type": "done", "words": n})]),
+            media_type="application/x-ndjson")
 
     ip = request.client.host if request.client else "?"
     check_rate(ip)
     if chapter_lock.locked():
         raise HTTPException(429, "busy, retry in a few seconds")
-    async with chapter_lock:
-        answer = await asyncio.to_thread(
-            run_claude, CHAPTER_TEMPLATE + text, CHAPTER_TIMEOUT_S
-        )
-    p.write_text(answer)
-    return {"text": answer, "cached": False}
+
+    q: asyncio.Queue = asyncio.Queue()
+    task = asyncio.create_task(chapter_job(text, p, q))
+    task.add_done_callback(lambda t: t.exception())  # гасим "never retrieved"
+
+    async def gen():
+        while True:
+            item = await q.get()
+            yield json.dumps(item, ensure_ascii=False) + "\n"
+            if item["type"] in ("done", "error"):
+                return
+
+    return StreamingResponse(gen(), media_type="application/x-ndjson")
