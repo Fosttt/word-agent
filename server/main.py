@@ -41,6 +41,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
+import offline_dict
+
 TOKEN = os.environ.get("WORD_AGENT_TOKEN", "")
 MODEL = os.environ.get("WORD_AGENT_MODEL", "haiku")
 CLAUDE_BIN = os.environ.get("WORD_AGENT_CLAUDE_BIN", "claude")
@@ -351,6 +353,11 @@ async def health():
     return {"ok": True, "model": MODEL, "dict_words": len(DICT)}
 
 
+@app.get("/health/offline")
+async def health_offline():
+    return await asyncio.to_thread(offline_dict.stats)
+
+
 @app.post("/word")
 async def word(req: WordReq, request: Request,
                x_auth_token: str | None = Header(default=None)):
@@ -410,11 +417,28 @@ async def chapter_job(text: str, cache_file: Path,
             known = [w for w in words if w in DICT and not is_name(DICT[w])]
             cached_lines = [DICT[w] for w in known]
             unknown = [w for w in words if w not in DICT]
+
+            # офлайн-резолв (MUSE+IPA+CEFR): большинство новых слов — без LLM
+            def offline_pass():
+                inst, rest = [], []
+                for w in unknown:
+                    line = offline_dict.resolve(w)
+                    if line:
+                        inst.append(line)
+                    else:
+                        rest.append(w)
+                return inst, rest
+
+            offline_lines, llm_words = await asyncio.to_thread(offline_pass)
+            for line in offline_lines:
+                dict_put(line.split("|")[0].strip(), line)
+
+            instant = cached_lines + offline_lines
             await emit(type="meta", total=len(known) + len(unknown),
-                       cached=len(cached_lines))
-            lines = list(cached_lines)
-            if cached_lines:
-                await emit(type="lines", text="\n".join(cached_lines))
+                       cached=len(instant))
+            lines = list(instant)
+            if instant:
+                await emit(type="lines", text="\n".join(instant))
 
             async def word_batch(batch: list[str]):
                 raw = await run_claude_async(
@@ -431,11 +455,12 @@ async def chapter_job(text: str, cache_file: Path,
                     res[w] = f"{parts[0]} | {parts[1]} | phrase | {parts[3]} | {parts[4]}"
                 return "phrase", res
 
-            batches = [unknown[i:i + BATCH_SIZE]
-                       for i in range(0, len(unknown), BATCH_SIZE)]
-            # на паре предложений выражения искать нечего — не жжём квоту
-            tasks = [asyncio.create_task(phrases())] if len(text) >= 600 else []
-            tasks += [asyncio.create_task(word_batch(b)) for b in batches]
+            batches = [llm_words[i:i + BATCH_SIZE]
+                       for i in range(0, len(llm_words), BATCH_SIZE)]
+            tasks = [asyncio.create_task(word_batch(b)) for b in batches]
+            # выражения — самый долгий вызов; стартует следом за батчами,
+            # на паре предложений искать нечего — не жжём квоту
+            ph_task = asyncio.create_task(phrases()) if len(text) >= 600 else None
 
             got: dict[str, str] = {}
 
@@ -459,11 +484,15 @@ async def chapter_job(text: str, cache_file: Path,
                         await emit(type="lines", text="\n".join(new))
 
             await collect(tasks)
-            missing = [w for w in unknown if w not in got]
+            missing = [w for w in llm_words if w not in got]
             if missing:  # модель пропустила / батч упал — один ретрай
                 retry = [asyncio.create_task(word_batch(missing[i:i + BATCH_SIZE]))
                          for i in range(0, len(missing), BATCH_SIZE)]
                 await collect(retry)
+
+            if ph_task is not None:
+                await emit(type="status", text="слова готовы — ищу устойчивые выражения…")
+                await collect([ph_task])
 
             final = "\n".join(sorted(set(lines), key=str.lower))
             cache_file.write_text(final)

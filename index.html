@@ -403,6 +403,8 @@ async function lookupChapter(text) {
       render();
       if (meta) setStatus('готово ' + Math.min(dictLines.length, meta.total) +
         ' из ' + meta.total + ' слов…', false, true);
+    } else if (ev.type === 'status') {
+      setStatus(ev.text, false, true);
     } else if (ev.type === 'done') {
       render();
     } else if (ev.type === 'error') {
