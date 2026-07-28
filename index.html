@@ -294,6 +294,20 @@ form.addEventListener('submit', ev => {
   if (text) lookup(text);
 });
 
+// пока пользователь печатает слово, сервер заранее греет процессы claude —
+// к моменту Enter остаётся только время самой модели
+let lastWarm = 0;
+function prewarm() {
+  const now = Date.now();
+  if (now - lastWarm < 45000) return;
+  lastWarm = now;
+  fetch(API_BASE + '/prewarm', {
+    method: 'POST', headers: { 'X-Auth-Token': TOKEN }
+  }).catch(() => {});
+}
+q.addEventListener('focus', prewarm);
+q.addEventListener('input', prewarm);
+
 // ---- режим «Глава»: словарь всех слов главы ----
 
 function esc(s) {

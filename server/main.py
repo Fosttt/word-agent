@@ -78,7 +78,11 @@ _word_waiters = 0
 WORD_QUEUE_MAX = 3  # 1 активный + 2 ждут; дальше честный 429
 _hits: dict[str, deque] = defaultdict(deque)
 
-TEMPLATE = """Обрабатывай английское слово или выражение по данному шаблону. \
+# Разбор слова разбит на два независимых промпта, которые идут в claude
+# ПАРАЛЛЕЛЬНО (семафор 2): основная карточка (уровень, частотность,
+# словосочетания) и хвост (семейство слов, исследование). Полное время ≈
+# времени длинной половины вместо суммы всех разделов.
+TEMPLATE_MAIN = """Обрабатывай английское слово или выражение по данному шаблону. \
 Отвечай в Markdown.
 
 **СЛОВО ИЛИ ВЫРАЖЕНИЕ** (всегда КАПСОМ и жирным) - русский эквивалент
@@ -103,6 +107,27 @@ Obsolete ☠️ | Limited Use ⚠️ | Current ✅ (укажи один, обя�
 новой строки, — русский перевод всего предложения в двойных фигурных скобках: \
 {{перевод предложения}}.
 
+Требования:
+Естественный, повседневный английский. Без перевода и русского текста, кроме \
+первого эквивалента и переводов в двойных фигурных скобках {{...}}. Разные \
+ситуации и значения. Никаких дополнительных комментариев до или после разбора. \
+НЕ добавляй никаких других разделов (семейство слов и происхождение делает \
+другой процесс).
+
+Опечатки:
+Если есть очевидная опечатка — исправь автоматически до наиболее вероятной \
+формы и работай с ней, без пояснений. Если исправление невозможно, обрабатывай \
+как редкое слово уровня C2 с частотностью 0/10.
+
+Названия разделов ВСЕГДА пиши по-русски, ровно так: «Частотность:», «Стиль:», \
+«Актуальность:», «Словосочетания:».
+
+Слово или выражение для разбора:
+"""
+
+TEMPLATE_EXTRA = """Для английского слова или выражения ниже выдай в Markdown \
+ТОЛЬКО перечисленные разделы, начиная ответ сразу со строки «Семейство слов:».
+
 Семейство слов:
 Просто перечисли родственные слова (без пояснений), после каждого слова сразу \
 ставь его русский перевод в двойных фигурных скобках: {{перевод}}.
@@ -117,19 +142,15 @@ Obsolete ☠️ | Limited Use ⚠️ | Current ✅ (укажи один, обя�
 Указывай ТОЛЬКО если запрос — словосочетание! (слабая / средняя / сильная)
 
 Требования:
-Естественный, повседневный английский. Без перевода и русского текста, кроме \
-первого эквивалента и переводов в двойных фигурных скобках {{...}}. Разные \
-ситуации и значения. Никаких дополнительных комментариев до или после разбора.
+Названия разделов пиши по-русски, ровно так: «Семейство слов:», \
+«Исследование:», «Устойчивость словосочетания:». Никаких других разделов, \
+заголовков и комментариев до или после.
 
 Опечатки:
 Если есть очевидная опечатка — исправь автоматически до наиболее вероятной \
-формы и работай с ней, без пояснений. Если исправление невозможно, обрабатывай \
-как редкое слово уровня C2 с частотностью 0/10.
+формы и работай с ней, без пояснений.
 
-Названия разделов ВСЕГДА пиши по-русски, ровно так: «Частотность:», «Стиль:», \
-«Актуальность:», «Словосочетания:», «Семейство слов:», «Исследование:».
-
-Слово или выражение для разбора:
+Слово или выражение:
 """
 
 BATCH_TEMPLATE = """Для каждого английского слова из списка ниже выдай ровно \
@@ -353,8 +374,17 @@ async def run_claude_async(prompt: str, timeout_s: int = TIMEOUT_S) -> str:
         return await asyncio.to_thread(run_claude, prompt, timeout_s)
 
 
-async def stream_claude(prompt: str, timeout_s: int = TIMEOUT_S):
-    """Генератор ('delta', кусок) … ('result', полный текст) из stream-json."""
+# ---- тёплый пул процессов claude -------------------------------------------
+# Старт node на этом VPS стоит ~2-2,5с — заметная часть задержки каждого слова.
+# Фронт при первом нажатии клавиши шлёт /prewarm, сервер заранее поднимает
+# процессы; к моменту Enter node уже загружен, остаётся только время модели.
+
+WARM_MAX = 2          # по числу параллельных половин разбора
+WARM_TTL_S = 120      # неиспользованный тёплый процесс убиваем (память 2ГБ VPS)
+_warm: list[asyncio.subprocess.Process] = []
+
+
+async def _spawn_stream_proc() -> asyncio.subprocess.Process:
     proc = await asyncio.create_subprocess_exec(
         CLAUDE_BIN, "-p", "--model", MODEL, "--disallowedTools", "*",
         "--output-format", "stream-json", "--include-partial-messages",
@@ -364,10 +394,55 @@ async def stream_claude(prompt: str, timeout_s: int = TIMEOUT_S):
         stderr=asyncio.subprocess.DEVNULL,
         env=CLAUDE_ENV,
     )
+    # CLI умирает, если stdin пуст 3 секунды — кормим таймер пробелом
+    # (промпт читается до EOF, лишний пробел в начале безвреден)
+    proc.stdin.write(b" ")
+    await proc.stdin.drain()
+    return proc
+
+
+async def _reap_warm(proc: asyncio.subprocess.Process):
+    await asyncio.sleep(WARM_TTL_S)
+    if proc in _warm:
+        _warm.remove(proc)
+        if proc.returncode is None:
+            proc.kill()
+        await proc.wait()
+
+
+async def prewarm_pool():
+    while len(_warm) < WARM_MAX:
+        proc = await _spawn_stream_proc()
+        _warm.append(proc)
+        asyncio.get_running_loop().create_task(_reap_warm(proc))
+
+
+def _take_warm() -> asyncio.subprocess.Process | None:
+    while _warm:
+        proc = _warm.pop(0)
+        if proc.returncode is None:
+            return proc
+    return None
+
+
+async def stream_claude(prompt: str, timeout_s: int = TIMEOUT_S):
+    """Генератор ('delta', кусок) … ('result', полный текст) из stream-json."""
+    proc = _take_warm()
+    if proc is None:
+        proc = await _spawn_stream_proc()
     try:
-        proc.stdin.write(prompt.encode())
-        await proc.stdin.drain()
-        proc.stdin.close()
+        try:
+            proc.stdin.write(prompt.encode())
+            await proc.stdin.drain()
+            proc.stdin.close()
+        except (BrokenPipeError, ConnectionResetError):
+            # тёплый процесс успел умереть — один холодный ретрай
+            proc.kill()
+            await proc.wait()
+            proc = await _spawn_stream_proc()
+            proc.stdin.write(prompt.encode())
+            await proc.stdin.drain()
+            proc.stdin.close()
         loop = asyncio.get_running_loop()
         deadline = loop.time() + timeout_s
         while True:
@@ -397,6 +472,18 @@ async def stream_claude(prompt: str, timeout_s: int = TIMEOUT_S):
             proc.kill()
 
 
+async def collect_stream(prompt: str, timeout_s: int = TIMEOUT_S) -> str:
+    """Полный текст ответа claude (через тёплый пул, под семафором)."""
+    async with claude_sem:
+        full, result = [], None
+        async for kind, chunk in stream_claude(prompt, timeout_s):
+            if kind == "delta":
+                full.append(chunk)
+            else:
+                result = chunk
+        return (result or "".join(full)).strip()
+
+
 class WordReq(BaseModel):
     text: str
 
@@ -404,6 +491,14 @@ class WordReq(BaseModel):
 @app.get("/health")
 async def health():
     return {"ok": True, "model": MODEL, "dict_words": len(DICT)}
+
+
+@app.post("/prewarm")
+async def prewarm(x_auth_token: str | None = Header(default=None)):
+    """Фронт дёргает при первом нажатии клавиши — греем процессы заранее."""
+    check_token(x_auth_token)
+    await prewarm_pool()
+    return {"warm": len(_warm)}
 
 
 @app.get("/health/offline")
@@ -439,12 +534,18 @@ async def word(req: WordReq, request: Request,
         except asyncio.TimeoutError:
             raise HTTPException(429, "busy, retry in a few seconds")
         try:
-            answer = await run_claude_async(TEMPLATE + text)
+            main, extra = await asyncio.gather(
+                collect_stream(TEMPLATE_MAIN + text),
+                collect_stream(TEMPLATE_EXTRA + text))
         finally:
             word_lock.release()
     finally:
         _word_waiters -= 1
-    p.write_text(answer)
+    if not main:
+        raise HTTPException(502, "empty LLM response")
+    answer = main + ("\n\n" + extra if extra else "")
+    if extra:  # без хвоста не кэшируем — пусть следующий запрос доберёт всё
+        p.write_text(answer)
     return {"text": answer, "cached": False}
 
 
@@ -484,20 +585,32 @@ async def word2(req: WordReq, request: Request,
                 yield j(type="error", detail="сервер занят — попробуй ещё раз через минуту")
                 return
             try:
+                # хвост (семейство/исследование) генерится параллельно
+                # с основной карточкой — на втором слоте семафора
+                extra_task = asyncio.create_task(
+                    collect_stream(TEMPLATE_EXTRA + text))
                 async with claude_sem:
                     full, result = [], None
-                    async for kind, chunk in stream_claude(TEMPLATE + text):
+                    async for kind, chunk in stream_claude(TEMPLATE_MAIN + text):
                         if kind == "delta":
                             full.append(chunk)
                             yield j(type="delta", text=chunk)
                         else:
                             result = chunk
-                    answer = result or "".join(full).strip()
-                    if not answer:
-                        yield j(type="error", detail="пустой ответ — попробуй ещё раз")
-                        return
-                    p.write_text(answer)
-                    yield j(type="done")
+                main = (result or "".join(full)).strip()
+                if not main:
+                    extra_task.cancel()
+                    yield j(type="error", detail="пустой ответ — попробуй ещё раз")
+                    return
+                try:
+                    extra = await extra_task
+                except Exception:
+                    extra = ""
+                if extra:
+                    yield j(type="delta", text="\n\n" + extra)
+                    # без хвоста не кэшируем — следующий запрос доберёт всё
+                    p.write_text(main + "\n\n" + extra)
+                yield j(type="done")
             finally:
                 word_lock.release()
         except HTTPException as e:
