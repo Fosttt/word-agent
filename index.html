@@ -288,14 +288,19 @@ async function lookup(text) {
         if (r.status === 429) { setStatus('сервер занят — подожди пару секунд и попробуй ещё раз', true); return; }
         if (!r.ok) { setStatus('ошибка сервера (' + r.status + ') — попробуй позже', true); return; }
         await readNdjson(r, ev => {
-          if (ev.type === 'delta') {
-            acc += ev.text;
+          if (ev.type === 'delta' || ev.type === 'preview') {
             if (!card) {
               card = document.createElement('div');
               card.className = 'card m-word';
               results.prepend(card);
             }
-            card.innerHTML = mdToHtml(acc);
+            if (ev.type === 'preview') {
+              // мгновенная карточка из офлайн-словаря; полный разбор её заменит
+              card.innerHTML = mdToHtml(ev.text);
+            } else {
+              acc += ev.text;
+              card.innerHTML = mdToHtml(acc);
+            }
           } else if (ev.type === 'error') {
             errMsg = ev.detail || 'ошибка сервера';
           }

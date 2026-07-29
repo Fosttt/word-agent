@@ -107,6 +107,13 @@ app.add_middleware(
 )
 app.add_middleware(BodyTimeoutASGI, timeout=15)
 
+
+@app.on_event("startup")
+async def _warm_offline_dict():
+    # офлайн-словари грузятся ~секунды — греем в фоне при старте, чтобы
+    # первая превьюшка слова не платила за загрузку
+    asyncio.get_running_loop().create_task(asyncio.to_thread(offline_dict.stats))
+
 # Глобальный лимит: максимум 2 процесса claude одновременно (2ГБ VPS).
 # word_lock дополнительно держит очередь слов честной (по одному),
 # chapter_lock — одна глава за раз.
@@ -623,6 +630,23 @@ def _word2_response(raw_text: str, request: Request):
         global _word_waiters
         _word_waiters += 1
         try:
+            # мгновенная превьюшка из офлайн-словарей (~0,3с у пользователя),
+            # пока haiku готовит полный разбор; фронт заменит её первой дельтой
+            if " " not in text:
+                try:
+                    line = await asyncio.to_thread(offline_dict.resolve, key)
+                    if line:
+                        _, ipa, pos, ru, lvl = [s.strip() for s in line.split("|")]
+                        emoji = {"A1": "🟢", "A2": "🟡", "B1": "🔵",
+                                 "B2": "🟣", "C1": "🟠", "C2": "🔴"}.get(lvl, "")
+                        # ≈: MUSE-перевод бывает неточным, полная карточка заменит
+                        prev = f"**{text.upper()}** ≈ {ru}"
+                        if ipa:
+                            prev += f"\n\n/{ipa.strip('/')}/"
+                        prev += f"\n\n{lvl} {emoji}\n\n*готовлю полный разбор…*"
+                        yield j(type="preview", text=prev)
+                except Exception:
+                    pass
             try:
                 await asyncio.wait_for(word_lock.acquire(), timeout=120)
             except asyncio.TimeoutError:
