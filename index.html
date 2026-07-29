@@ -252,37 +252,67 @@ function setStatus(text, isError, spin) {
   statusEl.innerHTML = (spin ? '<span class="spinner"></span>' : '') + text;
 }
 
+// fetch с таймаутом до первых байт ответа; вернувшийся Response несёт
+// свой AbortController в r._ctl — им же обрывается зависший стрим
+function fetchT(url, opts, headerMs) {
+  const ctl = new AbortController();
+  const timer = setTimeout(() => ctl.abort(), headerMs);
+  return fetch(url, Object.assign({ cache: 'no-store', signal: ctl.signal }, opts))
+    .then(r => { clearTimeout(timer); r._ctl = ctl; return r; },
+          e => { clearTimeout(timer); throw e; });
+}
+
 async function lookup(text) {
   go.disabled = true; q.disabled = true;
   setStatus('думаю над словом…', false, true);
-  let card = null, acc = '', errMsg = null;
-  try {
-    const r = await fetch(API, {
+  let card = null;
+  // мобильные сети иногда теряют тело POST (запрос виснет навсегда) —
+  // основной путь теперь лёгкий GET без preflight, 3 попытки новым
+  // соединением, последняя — старый POST на всякий случай
+  const getUrl = API + '?text=' + encodeURIComponent(text) + '&token=' + TOKEN;
+  const attempts = [
+    () => fetchT(getUrl, {}, 25000),
+    () => fetchT(getUrl, {}, 25000),
+    () => fetchT(API, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'X-Auth-Token': TOKEN },
       body: JSON.stringify({ text })
-    });
-    if (r.status === 429) { setStatus('сервер занят — подожди пару секунд и попробуй ещё раз', true); return; }
-    if (!r.ok) { setStatus('ошибка сервера (' + r.status + ') — попробуй позже', true); return; }
-    await readNdjson(r, ev => {
-      if (ev.type === 'delta') {
-        acc += ev.text;
-        if (!card) {
-          card = document.createElement('div');
-          card.className = 'card m-word';
-          results.prepend(card);
+    }, 25000),
+  ];
+  try {
+    for (let i = 0; i < attempts.length; i++) {
+      let acc = '', errMsg = null;
+      if (card) { card.remove(); card = null; }
+      try {
+        const r = await attempts[i]();
+        if (r.status === 429) { setStatus('сервер занят — подожди пару секунд и попробуй ещё раз', true); return; }
+        if (!r.ok) { setStatus('ошибка сервера (' + r.status + ') — попробуй позже', true); return; }
+        await readNdjson(r, ev => {
+          if (ev.type === 'delta') {
+            acc += ev.text;
+            if (!card) {
+              card = document.createElement('div');
+              card.className = 'card m-word';
+              results.prepend(card);
+            }
+            card.innerHTML = mdToHtml(acc);
+          } else if (ev.type === 'error') {
+            errMsg = ev.detail || 'ошибка сервера';
+          }
+        }, r._ctl, 45000);
+        if (errMsg) { if (card) card.remove(); setStatus(errMsg, true); return; }
+        if (!acc.trim()) { setStatus('пустой ответ — попробуй ещё раз', true); return; }
+        setStatus('');
+        q.value = '';
+        return;
+      } catch (e) {
+        if (i < attempts.length - 1) {
+          setStatus('связь шалит — пробую ещё раз (' + (i + 2) + '/' + attempts.length + ')…', false, true);
         }
-        card.innerHTML = mdToHtml(acc);
-      } else if (ev.type === 'error') {
-        errMsg = ev.detail || 'ошибка сервера';
       }
-    });
-    if (errMsg) { if (card) card.remove(); setStatus(errMsg, true); return; }
-    if (!acc.trim()) { setStatus('пустой ответ — попробуй ещё раз', true); return; }
-    setStatus('');
-    q.value = '';
-  } catch (e) {
-    setStatus('нет связи с сервером — проверь интернет', true);
+    }
+    if (card) card.remove();
+    setStatus('нет связи с сервером — проверь интернет или включи/выключи VPN', true);
   } finally {
     go.disabled = false; q.disabled = false; q.focus();
   }
@@ -301,9 +331,8 @@ function prewarm() {
   const now = Date.now();
   if (now - lastWarm < 45000) return;
   lastWarm = now;
-  fetch(API_BASE + '/prewarm', {
-    method: 'POST', headers: { 'X-Auth-Token': TOKEN }
-  }).catch(() => {});
+  // GET без preflight — один маленький пакет, проходит и там, где POST режут
+  fetch(API_BASE + '/prewarm?token=' + TOKEN, { cache: 'no-store' }).catch(() => {});
 }
 q.addEventListener('focus', prewarm);
 q.addEventListener('input', prewarm);
@@ -366,11 +395,13 @@ function renderDict(raw) {
 }
 
 function postChapter(text) {
-  return fetch(API_CHAPTER, {
+  // 30с на первые байты ответа — зависший запрос обрывается и уходит в
+  // pollChapter вместо вечного спиннера
+  return fetchT(API_CHAPTER, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', 'X-Auth-Token': TOKEN },
     body: JSON.stringify({ text })
-  });
+  }, 30000);
 }
 
 // связь оборвалась или сервер занят — он всё равно досчитывает и кладёт ответ
@@ -388,23 +419,36 @@ async function pollChapter(text, msg) {
   throw new Error('poll timeout');
 }
 
-// читаем поток NDJSON-событий сервера, дёргая onEvent для каждого объекта
-async function readNdjson(r, onEvent) {
+// читаем поток NDJSON-событий сервера, дёргая onEvent для каждого объекта;
+// ctl+stallMs — сторожок: нет новых байт stallMs подряд → обрыв (throw),
+// вызывающий код сам решает, ретраить ли
+async function readNdjson(r, onEvent, ctl, stallMs) {
   const reader = r.body.getReader();
   const dec = new TextDecoder();
-  let buf = '';
-  for (;;) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    buf += dec.decode(value, { stream: true });
-    let i;
-    while ((i = buf.indexOf('\n')) >= 0) {
-      const line = buf.slice(0, i).trim();
-      buf = buf.slice(i + 1);
-      if (line) onEvent(JSON.parse(line));
+  let buf = '', timer = null;
+  const kick = () => {
+    if (!ctl || !stallMs) return;
+    clearTimeout(timer);
+    timer = setTimeout(() => ctl.abort(), stallMs);
+  };
+  kick();
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      kick();
+      if (done) break;
+      buf += dec.decode(value, { stream: true });
+      let i;
+      while ((i = buf.indexOf('\n')) >= 0) {
+        const line = buf.slice(0, i).trim();
+        buf = buf.slice(i + 1);
+        if (line) onEvent(JSON.parse(line));
+      }
     }
+    if (buf.trim()) onEvent(JSON.parse(buf.trim()));
+  } finally {
+    clearTimeout(timer);
   }
-  if (buf.trim()) onEvent(JSON.parse(buf.trim()));
 }
 
 async function lookupChapter(text) {
@@ -456,12 +500,13 @@ async function lookupChapter(text) {
     }
     if (!r.ok) { setStatus('ошибка сервера (' + r.status + ') — попробуй позже', true); return; }
     try {
-      await readNdjson(r, onEvent);
+      // до 4 минут тишины между батчами LLM — норма, дальше считаем обрывом
+      await readNdjson(r, onEvent, r._ctl, 240000);
     } catch (e) {
       // поток оборвался — сервер досчитывает в кэш, дождёмся и перечитаем
       r = await pollChapter(text, 'связь прервалась, но сервер досчитывает — жду результат…');
       dictLines = []; meta = null; errMsg = null;
-      await readNdjson(r, onEvent);
+      await readNdjson(r, onEvent, r._ctl, 240000);
     }
     if (errMsg) { setStatus(errMsg, true); return; }
     if (!dictLines.length) { setStatus('не получилось разобрать ответ — попробуй ещё раз', true); return; }

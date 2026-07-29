@@ -58,6 +58,44 @@ RATE_WINDOW_S = 60
 RATE_MAX = 10  # запросов с одного IP в минуту (кэш-хиты не считаются)
 
 app = FastAPI(title="word-agent")
+
+
+class BodyTimeoutASGI:
+    """Обрывает запрос, если тело не дошло за timeout секунд.
+
+    Мобильные операторы иногда теряют пакеты с телом POST (заголовки дошли,
+    JSON — нет): без таймаута соединение висит в ESTAB вечно и копится.
+    Таймаут действует только до полного получения тела; дальше receive()
+    используется стримингом для слежения за разрывом — там ждать можно сколько
+    угодно.
+    """
+
+    def __init__(self, app, timeout: float = 15):
+        self.app = app
+        self.timeout = timeout
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            return await self.app(scope, receive, send)
+        body_done = False
+
+        async def recv():
+            nonlocal body_done
+            if body_done:
+                return await receive()
+            try:
+                msg = await asyncio.wait_for(receive(), timeout=self.timeout)
+            except asyncio.TimeoutError:
+                body_done = True
+                return {"type": "http.disconnect"}
+            if msg["type"] == "http.disconnect" or (
+                    msg["type"] == "http.request" and not msg.get("more_body")):
+                body_done = True
+            return msg
+
+        await self.app(scope, recv, send)
+
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
@@ -67,6 +105,7 @@ app.add_middleware(
     allow_methods=["POST", "GET"],
     allow_headers=["X-Auth-Token", "Content-Type"],
 )
+app.add_middleware(BodyTimeoutASGI, timeout=15)
 
 # Глобальный лимит: максимум 2 процесса claude одновременно (2ГБ VPS).
 # word_lock дополнительно держит очередь слов честной (по одному),
@@ -501,6 +540,14 @@ async def prewarm(x_auth_token: str | None = Header(default=None)):
     return {"warm": len(_warm)}
 
 
+@app.get("/prewarm")
+async def prewarm_get(token: str | None = None):
+    """GET-вариант без preflight — см. word2_get."""
+    check_token(token)
+    await prewarm_pool()
+    return {"warm": len(_warm)}
+
+
 @app.get("/health/offline")
 async def health_offline():
     return await asyncio.to_thread(offline_dict.stats)
@@ -549,12 +596,9 @@ async def word(req: WordReq, request: Request,
     return {"text": answer, "cached": False}
 
 
-@app.post("/word2")
-async def word2(req: WordReq, request: Request,
-                x_auth_token: str | None = Header(default=None)):
+def _word2_response(raw_text: str, request: Request):
     """Стриминг разбора слова NDJSON: delta… → done (или error)."""
-    check_token(x_auth_token)
-    text = " ".join(req.text.split()).strip()
+    text = " ".join(raw_text.split()).strip()
     if not text:
         raise HTTPException(400, "empty request")
     if len(text) > 80:
@@ -620,7 +664,27 @@ async def word2(req: WordReq, request: Request,
         finally:
             _word_waiters -= 1
 
-    return StreamingResponse(gen(), media_type="application/x-ndjson")
+    return StreamingResponse(gen(), media_type="application/x-ndjson",
+                             headers={"Cache-Control": "no-store"})
+
+
+@app.post("/word2")
+async def word2(req: WordReq, request: Request,
+                x_auth_token: str | None = Header(default=None)):
+    check_token(x_auth_token)
+    return _word2_response(req.text, request)
+
+
+@app.get("/word2")
+async def word2_get(request: Request, text: str = "", token: str | None = None):
+    """GET-вариант: без CORS-preflight и без тела запроса.
+
+    Мобильные сети/DPI иногда съедают тело POST (заголовки доходят, JSON нет) —
+    GET умещается в один маленький пакет и проходит там, где POST виснет.
+    Токен и так лежит открыто в JS сайта, в query он ничем не хуже заголовка.
+    """
+    check_token(token)
+    return _word2_response(text, request)
 
 
 # ---- глава ------------------------------------------------------------------
