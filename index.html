@@ -262,62 +262,88 @@ function fetchT(url, opts, headerMs) {
           e => { clearTimeout(timer); throw e; });
 }
 
+// обычный fetch на весь ответ целиком (GET с Content-Length): abort-сторож
+// держится и на чтении тела, чтобы зависший body не завис навсегда.
+// Возвращает {text} | {busy:true} | {}
+async function fetchFull(url, ms) {
+  const ctl = new AbortController();
+  const timer = setTimeout(() => ctl.abort(), ms);
+  try {
+    const r = await fetch(url, { cache: 'no-store', signal: ctl.signal });
+    if (r.status === 429) return { busy: true };
+    if (!r.ok) return {};
+    const j = await r.json();
+    return { text: (j && (j.text || (j.ready && j.text))) || '' };
+  } finally { clearTimeout(timer); }
+}
+
+// надёжный не-стримовый разбор. Сначала GET /word (обычное тело с
+// Content-Length — проходит там, где chunked-стрим режут мобильные прокси).
+// Если соединение оборвалось — поллим /word_cached: сервер под shield всё
+// равно досчитывает ответ в кэш. Возвращает текст | '' | 'BUSY'.
+async function getWordReliable(text) {
+  const wordUrl = API_BASE + '/word?text=' + encodeURIComponent(text) + '&token=' + TOKEN;
+  const cachedUrl = API_BASE + '/word_cached?text=' + encodeURIComponent(text) + '&token=' + TOKEN;
+  for (let i = 0; i < 2; i++) {
+    try {
+      const r = await fetchFull(wordUrl, 95000);
+      if (r.busy) return 'BUSY';
+      if (r.text && r.text.trim()) return r.text;
+    } catch (e) { /* оборвалось — добираем из кэша ниже */ }
+    for (let n = 0; n < 30; n++) {            // до 90с: сервер досчитывает в кэш
+      await new Promise(res => setTimeout(res, 3000));
+      try {
+        const c = await fetchFull(cachedUrl, 10000);
+        if (c.text && c.text.trim()) return c.text;
+      } catch (e) {}
+    }
+  }
+  return '';
+}
+
 async function lookup(text) {
   go.disabled = true; q.disabled = true;
   setStatus('думаю над словом…', false, true);
   let card = null;
-  // мобильные сети иногда теряют тело POST (запрос виснет навсегда) —
-  // основной путь теперь лёгкий GET без preflight, 3 попытки новым
-  // соединением, последняя — старый POST на всякий случай
-  const getUrl = API + '?text=' + encodeURIComponent(text) + '&token=' + TOKEN;
-  const attempts = [
-    () => fetchT(getUrl, {}, 25000),
-    () => fetchT(getUrl, {}, 25000),
-    () => fetchT(API, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'X-Auth-Token': TOKEN },
-      body: JSON.stringify({ text })
-    }, 25000),
-  ];
+  const showCard = html => {
+    if (!card) {
+      card = document.createElement('div');
+      card.className = 'card m-word';
+      results.prepend(card);
+    }
+    card.innerHTML = html;
+  };
   try {
-    for (let i = 0; i < attempts.length; i++) {
-      let acc = '', errMsg = null;
-      if (card) { card.remove(); card = null; }
-      try {
-        const r = await attempts[i]();
-        if (r.status === 429) { setStatus('сервер занят — подожди пару секунд и попробуй ещё раз', true); return; }
-        if (!r.ok) { setStatus('ошибка сервера (' + r.status + ') — попробуй позже', true); return; }
+    // 1) Быстрый стриминг — приятный прогрессивный разбор на нормальной сети.
+    //    Если за 12с не пришло НИ БАЙТА (мобильный прокси буферит/режет
+    //    chunked-ответ), молча уходим на надёжный не-стримовый путь ниже.
+    try {
+      const url = API + '?text=' + encodeURIComponent(text) + '&token=' + TOKEN;
+      const r = await fetchT(url, {}, 12000);
+      if (r.status === 429) { setStatus('сервер занят — подожди пару секунд и попробуй ещё раз', true); return; }
+      if (r.ok) {
+        let acc = '', errMsg = null;
         await readNdjson(r, ev => {
-          if (ev.type === 'delta' || ev.type === 'preview') {
-            if (!card) {
-              card = document.createElement('div');
-              card.className = 'card m-word';
-              results.prepend(card);
-            }
-            if (ev.type === 'preview') {
-              // мгновенная карточка из офлайн-словаря; полный разбор её заменит
-              card.innerHTML = mdToHtml(ev.text);
-            } else {
-              acc += ev.text;
-              card.innerHTML = mdToHtml(acc);
-            }
+          if (ev.type === 'preview') {
+            showCard(mdToHtml(ev.text));      // мгновенная карточка из офлайн-словаря
+          } else if (ev.type === 'delta') {
+            acc += ev.text; showCard(mdToHtml(acc));
           } else if (ev.type === 'error') {
             errMsg = ev.detail || 'ошибка сервера';
           }
-        }, r._ctl, 45000);
-        if (errMsg) { if (card) card.remove(); setStatus(errMsg, true); return; }
-        if (!acc.trim()) { setStatus('пустой ответ — попробуй ещё раз', true); return; }
-        setStatus('');
-        q.value = '';
-        return;
-      } catch (e) {
-        if (i < attempts.length - 1) {
-          setStatus('связь шалит — пробую ещё раз (' + (i + 2) + '/' + attempts.length + ')…', false, true);
-        }
+        }, r._ctl, 12000);
+        if (!errMsg && acc.trim()) { setStatus(''); q.value = ''; return; }
       }
-    }
-    if (card) card.remove();
-    setStatus('нет связи с сервером — проверь интернет или включи/выключи VPN', true);
+    } catch (e) { /* стрим не прошёл — надёжный путь ниже */ }
+    if (card) { card.remove(); card = null; }
+
+    // 2) Надёжный путь: обычный ответ целиком (Content-Length) + поллинг кэша.
+    setStatus('связь капризничает — беру ответ целиком…', false, true);
+    const full = await getWordReliable(text);
+    if (full === 'BUSY') { setStatus('сервер занят — подожди пару секунд и попробуй ещё раз', true); return; }
+    if (!full) { setStatus('нет связи с сервером — проверь интернет или включи/выключи VPN', true); return; }
+    showCard(mdToHtml(full));
+    setStatus(''); q.value = '';
   } finally {
     go.disabled = false; q.disabled = false; q.focus();
   }

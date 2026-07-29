@@ -560,27 +560,14 @@ async def health_offline():
     return await asyncio.to_thread(offline_dict.stats)
 
 
-@app.post("/word")
-async def word(req: WordReq, request: Request,
-               x_auth_token: str | None = Header(default=None)):
-    check_token(x_auth_token)
-    text = " ".join(req.text.split()).strip()
-    if not text:
-        raise HTTPException(400, "empty request")
-    if len(text) > 80:
-        raise HTTPException(400, "too long — one word or phrase, please")
+async def _compute_word(text: str, key: str, p: Path) -> str:
+    """Считает полный разбор слова и кладёт в кэш; возвращает готовый текст.
 
-    key = text.lower()
-    p = cache_path(key)
-    if p.exists():
-        return {"text": p.read_text(), "cached": True}
-
-    ip = request.client.host if request.client else "?"
-    check_rate(ip)
-    # ждём своей очереди вместо мгновенного 429 (фронт и так крутит спиннер)
+    Вынесено отдельно, чтобы вызывать под asyncio.shield: мобильная сеть часто
+    рвёт соединение раньше времени, но счёт всё равно доводится до конца и
+    пишется в кэш — повторный запрос или /word_cached заберут готовое мгновенно.
+    """
     global _word_waiters
-    if _word_waiters >= WORD_QUEUE_MAX:
-        raise HTTPException(429, "busy, retry in a few seconds")
     _word_waiters += 1
     try:
         try:
@@ -600,7 +587,63 @@ async def word(req: WordReq, request: Request,
     answer = main + ("\n\n" + extra if extra else "")
     if extra:  # без хвоста не кэшируем — пусть следующий запрос доберёт всё
         p.write_text(answer)
+    return answer
+
+
+async def _word_answer(raw_text: str, request: Request) -> dict:
+    """Полный (не-стримовый) разбор слова: {text, cached}.
+
+    Ответ идёт с Content-Length обычным телом — в отличие от chunked-стрима
+    /word2 он надёжно проходит через мобильные прокси/DPI, которые буферизуют
+    или рвут chunked-ответы (из-за чего у пользователя «нет связи с сервером»).
+    """
+    text = " ".join(raw_text.split()).strip()
+    if not text:
+        raise HTTPException(400, "empty request")
+    if len(text) > 80:
+        raise HTTPException(400, "too long — one word or phrase, please")
+
+    key = text.lower()
+    p = cache_path(key)
+    if p.exists():
+        return {"text": p.read_text(), "cached": True}
+
+    ip = request.client.host if request.client else "?"
+    check_rate(ip)
+    # ждём своей очереди вместо мгновенного 429 (фронт и так крутит спиннер)
+    if _word_waiters >= WORD_QUEUE_MAX:
+        raise HTTPException(429, "busy, retry in a few seconds")
+    # shield: даже если клиент отвалится, доводим счёт до кэша
+    answer = await asyncio.shield(_compute_word(text, key, p))
     return {"text": answer, "cached": False}
+
+
+@app.post("/word")
+async def word(req: WordReq, request: Request,
+               x_auth_token: str | None = Header(default=None)):
+    check_token(x_auth_token)
+    return await _word_answer(req.text, request)
+
+
+@app.get("/word")
+async def word_get(request: Request, text: str = "", token: str | None = None):
+    """GET-вариант /word: без CORS-preflight и без тела (мобильные сети режут
+    тело POST — заголовки доходят, JSON нет). Надёжный основной путь фронта."""
+    check_token(token)
+    return await _word_answer(text, request)
+
+
+@app.get("/word_cached")
+async def word_cached(text: str = "", token: str | None = None):
+    """Только кэш: {ready, text}. Фронт поллит сюда, если соединение оборвалось,
+    пока сервер под shield досчитывает ответ в кэш."""
+    check_token(token)
+    key = " ".join(text.split()).strip().lower()
+    if key:
+        p = cache_path(key)
+        if p.exists():
+            return {"ready": True, "text": p.read_text()}
+    return {"ready": False}
 
 
 def _word2_response(raw_text: str, request: Request):
