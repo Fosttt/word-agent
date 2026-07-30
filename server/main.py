@@ -53,6 +53,7 @@ CHAPTER_MAX_CHARS = int(os.environ.get("WORD_AGENT_CHAPTER_MAX", "20000"))
 CACHE_DIR = Path(os.environ.get("WORD_AGENT_CACHE", "~/.cache/word_agent")).expanduser()
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 DICT_PATH = CACHE_DIR / "dict.jsonl"
+ANKI_PATH = CACHE_DIR / "anki.jsonl"
 
 RATE_WINDOW_S = 60
 RATE_MAX = 10  # запросов с одного IP в минуту (кэш-хиты не считаются)
@@ -327,6 +328,40 @@ if DICT_PATH.exists():
             continue
 
 
+# ---- колода Anki: слова, когда-либо разобранные в режиме «Слово» -----------
+
+ANKI: dict[str, dict] = {}
+if ANKI_PATH.exists():
+    for _line in ANKI_PATH.read_text().splitlines():
+        try:
+            _rec = json.loads(_line)
+            ANKI[_rec["word"].lower()] = _rec
+        except (json.JSONDecodeError, KeyError):
+            continue
+
+# первая строка ответа режима «Слово» всегда "**СЛОВО** - перевод" (шаблон
+# TEMPLATE_MAIN) — этого достаточно, чтобы завести карточку без нового вызова LLM
+ANKI_WORD_RE = re.compile(r"^\*\*(.+?)\*\*\s*[-—]\s*(.+)$", re.MULTILINE)
+ANKI_LEVEL_RE = re.compile(r"\b([ABC][12])\b")
+
+
+def anki_capture(answer: str):
+    """Заводит карточку из уже посчитанного ответа /word, если её ещё нет."""
+    m = ANKI_WORD_RE.search(answer[:200])
+    if not m:
+        return
+    word = m.group(1).strip()
+    key = word.lower()
+    if not word or key in ANKI:
+        return
+    lvl_m = ANKI_LEVEL_RE.search(answer[:300])
+    rec = {"word": word, "ru": m.group(2).strip(),
+           "lvl": lvl_m.group(1) if lvl_m else "", "added": time.time()}
+    ANKI[key] = rec
+    with ANKI_PATH.open("a") as f:
+        f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+
+
 def is_name(line: str) -> bool:
     """Строка-маркер имени собственного (pos == name) — в словарь не идёт."""
     parts = line.split("|")
@@ -587,6 +622,7 @@ async def _compute_word(text: str, key: str, p: Path) -> str:
     answer = main + ("\n\n" + extra if extra else "")
     if extra:  # без хвоста не кэшируем — пусть следующий запрос доберёт всё
         p.write_text(answer)
+        anki_capture(answer)
     return answer
 
 
@@ -720,7 +756,9 @@ def _word2_response(raw_text: str, request: Request):
                 if extra:
                     yield j(type="delta", text="\n\n" + extra)
                     # без хвоста не кэшируем — следующий запрос доберёт всё
-                    p.write_text(main + "\n\n" + extra)
+                    full_answer = main + "\n\n" + extra
+                    p.write_text(full_answer)
+                    anki_capture(full_answer)
                 yield j(type="done")
             finally:
                 word_lock.release()
@@ -930,3 +968,25 @@ async def chapter2(req: WordReq, request: Request,
                 return
 
     return StreamingResponse(gen(), media_type="application/x-ndjson")
+
+
+# ---- карточки Anki -----------------------------------------------------------
+# Добавление карточки — тот же /word2 (или /word), он сам заводит запись через
+# anki_capture; отдельного эндпоинта на добавление не нужно.
+
+@app.get("/anki/list")
+async def anki_list(token: str | None = None):
+    check_token(token)
+    items = sorted(ANKI.values(), key=lambda r: r.get("added", 0), reverse=True)
+    return {"items": items}
+
+
+@app.get("/anki/remove")
+async def anki_remove(word: str = "", token: str | None = None):
+    check_token(token)
+    key = word.strip().lower()
+    if key in ANKI:
+        del ANKI[key]
+        ANKI_PATH.write_text(
+            "".join(json.dumps(r, ensure_ascii=False) + "\n" for r in ANKI.values()))
+    return {"ok": True}
