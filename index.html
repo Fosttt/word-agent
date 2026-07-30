@@ -187,6 +187,9 @@
   .cf-lvl { position: absolute; top: 12px; right: 14px; font-size: .95em; }
   .cf-del { position: absolute; top: 10px; left: 12px; color: var(--muted); font-size: .95em;
     cursor: pointer; padding: 4px 6px; line-height: 1; }
+  .cf-say { position: absolute; bottom: 10px; left: 12px; color: var(--muted); font-size: 1.1em;
+    cursor: pointer; padding: 4px 6px; line-height: 1; }
+  .cf-say:active { color: var(--accent); }
   .cf-small { font-size: .95em; color: var(--muted); }
   .cf-ru { font-size: 1.25em; }
 
@@ -465,6 +468,14 @@ q.addEventListener('input', prewarm);
 
 function esc(s) {
   return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
+function speak(text) {
+  if (!('speechSynthesis' in window)) return;
+  window.speechSynthesis.cancel();
+  const u = new SpeechSynthesisUtterance(text);
+  u.lang = 'en-US';
+  window.speechSynthesis.speak(u);
 }
 
 // парсим строки "слово | ipa | часть речи | перевод | уровень"
@@ -759,10 +770,12 @@ function renderDeck() {
           (card.lvl ? '<span class="cf-lvl">' + (LVL[card.lvl] || '') + '</span>' : '') +
           '<div class="cf-word">' + esc(card.word) + '</div>' +
           '<div class="cf-hint">нажми, чтобы увидеть перевод</div>' +
+          '<span class="cf-say" id="cfSayFront" title="произнести">🔊</span>' +
         '</div>' +
         '<div class="card-face card-back">' +
           '<div class="cf-small">' + esc(card.word) + (card.lvl ? ' · ' + card.lvl : '') + '</div>' +
           '<div class="cf-ru">' + esc(card.ru) + '</div>' +
+          '<span class="cf-say" id="cfSayBack" title="произнести">🔊</span>' +
         '</div>' +
       '</div>' +
     '</div>' +
@@ -786,6 +799,12 @@ function renderDeck() {
   document.getElementById('cfDel').addEventListener('click', ev => {
     ev.stopPropagation();
     removeCard(card);
+  });
+  ['cfSayFront', 'cfSayBack'].forEach(id => {
+    document.getElementById(id).addEventListener('click', ev => {
+      ev.stopPropagation();
+      speak(card.word);
+    });
   });
   document.getElementById('detailToggle').addEventListener('click', () => showDetail(card));
   document.getElementById('navPrev').addEventListener('click', () => step(-1));
